@@ -243,3 +243,13 @@ HealthMate is an AI-powered informational tool. It is **not a substitute for pro
 - [HuggingFace](https://huggingface.co/) — Sentence embeddings
 - [FAISS](https://faiss.ai/) — Vector similarity search
 - [Streamlit](https://streamlit.io/) — UI & deployment
+
+---
+
+## 👩‍💻 Author
+
+**Reemika Subrata Das**
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-reemikadas-blue?logo=linkedin&style=flat)](https://linkedin.com/in/reemikadas)
+[![GitHub](https://img.shields.io/badge/GitHub-reemikadas-black?logo=github&style=flat)](https://github.com/reemikadas)
+[![Email](https://img.shields.io/badge/Email-das.reemika%40gmail.com-red?logo=gmail&style=flat)](mailto:das.reemika@gmail.com)
