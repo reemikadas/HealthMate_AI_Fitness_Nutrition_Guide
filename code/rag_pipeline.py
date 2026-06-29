@@ -1,265 +1,129 @@
-# =================================================
-# Load the libraries
-# =================================================
-import os
-from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-#from langchain import hub
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
-from langchain.chains.history_aware_retriever import create_history_aware_retriever
-from langchain_core.prompts import MessagesPlaceholder
+"""HealthMate conversational RAG service.
 
-# =================================================
-# STEP 1: Load the Environment
-# =================================================
-load_dotenv()
-
-# =================================================
-# STEP 2: Setup the API Key --> Provider: Groq
-# =================================================
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-
-# =================================================
-# STEP 3: Define the LLM model
-# =================================================
-# GROQ_MODEL_NAME = "llama-3.1-8b-instant"
-GROQ_MODEL_NAME = "openai/gpt-oss-20b"
-
-llm = ChatGroq(
-    model = GROQ_MODEL_NAME,
-    temperature = 0, # For creativity in answers
-    max_tokens = 512, # Max No. of tokens to generate
-    api_key = GROQ_API_KEY
-)
-
-# ==================================================================================================
-# STEP 4: Load the Knowledge Base --> Embedding Provider: HuggingFace | Vector_db provider: FAISS
-# ==================================================================================================
-DB_FAISS_PATH = "../vector_store/db_faiss"
-
-hugface_emb_model = "sentence-transformers/all-MiniLM-L6-v2"
-embedding_model = HuggingFaceEmbeddings(model_name = hugface_emb_model)
-
-vector_db = FAISS.load_local(
-    DB_FAISS_PATH,
-    embedding_model,
-    allow_dangerous_deserialization = True
-)
-
-# =================================================
-# STEP 5: Building a RAG Chain
-# =================================================
-
-# STEP 5(a): Query Rewriting Prompt
-# =================================================
-contextualize_q_system_prompt = """
-Given a chat history and the latest user question,
-rewrite the latest question into a standalone question
-that can be understood without the chat history.
-
-Do NOT answer the question.
-Only rewrite it if needed.
-Otherwise, return it as-is.
+The expensive embedding model and vector database are initialized on the first
+request instead of at module import, which keeps API startup fast and makes
+configuration errors visible through the health endpoint.
 """
 
-contextualize_q_prompt = ChatPromptTemplate.from_messages([
-    ("system", contextualize_q_system_prompt),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}")
-])
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DB_FAISS_PATH = ROOT_DIR / "vector_store" / "db_faiss"
+GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-20b")
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-# STEP 5(b): Defining Chat Prompt
-# =================================================
-#rag_predefined_chat_prompt = hub.pull("langchain-ai/retrieval-qa-chat")
+@lru_cache(maxsize=1)
+def get_rag_pipeline() -> Any:
+    """Build and cache the RAG chain."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not configured. Add it to your environment or .env file."
+        )
+    if not DB_FAISS_PATH.exists():
+        raise RuntimeError(
+            "The FAISS knowledge base is missing. Run `python code/indexing.py` first."
+        )
 
-rag_custom_prompt = ChatPromptTemplate.from_messages([("system", """
-You are an expert AI Fitness and Nutrition Assistant.
-                                                     
-Your role is to help users with:
-- workout planning
-- exercise guidance
-- muscle building
-- fat loss
-- nutrition advice
-- meal suggestions
-- recovery tips
-- healthy lifestyle habits
-                                                     
-Use ONLY the provided context to answer the question.
+    from langchain.chains import create_retrieval_chain
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain.chains.history_aware_retriever import (
+        create_history_aware_retriever,
+    )
+    from langchain_community.vectorstores import FAISS
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_groq import ChatGroq
+    from langchain_huggingface import HuggingFaceEmbeddings
 
-If the answer is not available in the context:
-- Say: "I could not find relevant information in the knowledge base."
-- Do NOT make up information.
+    llm = ChatGroq(
+        model=GROQ_MODEL_NAME,
+        temperature=0,
+        max_tokens=512,
+        api_key=api_key,
+    )
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    vector_db = FAISS.load_local(
+        str(DB_FAISS_PATH),
+        embeddings,
+        allow_dangerous_deserialization=True,
+    )
 
-Guidelines:
-- Keep answers clear, concise, and beginner-friendly.
-- Use bullet points when appropriate.
-- Give actionable recommendations.
-- If discussing workouts, mention sets/reps only if available in context.
-- If discussing nutrition, explain calories/protein/macros only if available in context.
-- Avoid medical diagnosis or unsafe health advice.
-- If the user asks about injuries, medications, or serious medical conditions, suggest consulting a healthcare professional.
+    contextualize_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Given the chat history and latest user question, rewrite the "
+                "question so it stands alone. Do not answer it. If no rewrite "
+                "is needed, return it unchanged.",
+            ),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    answer_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are HealthMate, an expert fitness and nutrition assistant.
+Use only the supplied context. If the answer is unavailable, say: "I could not
+find relevant information in the knowledge base." Never invent information.
+
+Give clear, concise, beginner-friendly and actionable answers. Use bullets when
+useful. Mention workout sets/reps or nutrition numbers only when supported by
+the context. Do not diagnose medical conditions. For injuries, medication, or
+serious health concerns, recommend consulting a qualified healthcare provider.
 
 <context>
 {context}
-</context>
-"""),
+</context>""",
+            ),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
 
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}")
-])
+    retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_prompt
+    )
+    document_chain = create_stuff_documents_chain(llm, answer_prompt)
+    return create_retrieval_chain(history_aware_retriever, document_chain)
 
-# STEP 5(c): Document combiner chain for stuffing chunks into prompt and sending it to LLM
-# =================================================
-#doc_combiner_chain = create_stuff_documents_chain(
-#    llm,
-#    rag_predefined_chat_prompt
-#)
 
-doc_combiner_chain = create_stuff_documents_chain(
-    llm,
-    rag_custom_prompt
-)
+def ask_healthmate(query: str, chat_history: list[dict[str, str]]) -> tuple[str, list[str]]:
+    """Answer a query and return its unique source labels."""
+    formatted_history = [
+        ("human" if message["role"] == "user" else "ai", message["content"])
+        for message in chat_history[-6:]
+        if message.get("role") in {"user", "assistant"} and message.get("content")
+    ]
+    response = get_rag_pipeline().invoke(
+        {"input": query, "chat_history": formatted_history}
+    )
 
-# STEP 5 (d): Combining Retriever with Document Combiner
-# =================================================
-retriever = vector_db.as_retriever(
-    search_kwargs = {'k': 3} # Top 3 chunks 
-)
+    sources = set()
+    for document in response["context"]:
+        source = Path(document.metadata.get("source", "Unknown source")).name
+        page = document.metadata.get("page")
+        page_label = f"Page {int(page) + 1}" if isinstance(page, int) else "Page N/A"
+        sources.add(f"{source} — {page_label}")
 
-history_aware_retriever = create_history_aware_retriever(
-    llm,
-    retriever,
-    contextualize_q_prompt
-)
+    return response["answer"], sorted(sources)
 
-#rag_pipe = create_retrieval_chain(
-#    retriever,
-#    doc_combiner_chain
-#)
 
-rag_pipe = create_retrieval_chain(
-    history_aware_retriever,
-    doc_combiner_chain
-)
-
-# =================================================
-# Query Function
-# =================================================
-def ask_healthmate(query, chat_history):
-
-    # Convert Streamlit History
-    formatted_chat_history = []
-
-    for msg in chat_history[-6:]:
-        if msg["role"] == "user":
-            formatted_chat_history.append(
-                ("human", msg["message"])
-            )
-        
-        elif msg["role"] == "assistant":
-            formatted_chat_history.append(
-                ("ai", msg["message"])
-            )
-    
-    # Invoke Conversational RAG
-    response = rag_pipe.invoke({
-        "input" : query,
-        "chat_history" : formatted_chat_history
-    })
-
-    answer = response["answer"]
-    docs = response["context"]
-
-    # Sources
-    sources = []
-
-    for doc in docs:
-        source = doc.metadata.get(
-            "source", "unknown"
-        )
-
-        page = doc.metadata.get(
-            "page", "N/A"
-        )
-
-        source_name = source.split("/")[-1]
-
-        sources.append(
-            f"{source_name} - (Page {page})"
-        )
-    
-    return answer, list(set(sources))
-
-#def ask_healthmate(query):
-#    response = rag_pipe.invoke({"input" : query})
-#    answer = response["answer"]
-#    docs = response["context"]
-
-#    sources = []
-
-#    for doc in docs:
-#        source = doc.metadata.get("source", "Unknown")
-#        page = doc.metadata.get("page", "N/A")
-
-        # Clean File Name
-#        source_name = source.split("/")[-1]
-
-#        sources.append(f"{source_name} - (Page {page})")
-
-#    return answer, list(set(sources))
-
-# =================================================
-# Evaluation Function
-# =================================================
-def ask_healthmate_for_eval(query):
-    # Invoke RAG Pipeline
-    response = rag_pipe.invoke({
-        "input" : query,
-        "chat_history" : []
-    })
-
-    answer = response["answer"]
-
-    docs = response["context"]
-
-    # Extract retrieved chunk text
-    #retrieved_chunks = [
-    #    doc.page_content for doc in docs
-    #]
-
+def ask_healthmate_for_eval(query: str) -> dict[str, Any]:
+    """Compatibility helper used by the existing evaluation scripts."""
+    response = get_rag_pipeline().invoke({"input": query, "chat_history": []})
     return {
-        "question" : query,
-        "answer" : answer,
-        "documents": docs
-        # "contexts" : retrieved_chunks
+        "question": query,
+        "answer": response["answer"],
+        "documents": response["context"],
     }
-
-# =================================================
-# Test with few queries
-#user_query = input("Write your Query Here: ")
-#response = rag_pipe.invoke({'input' : user_query})
-#result = response["answer"]
-#docs = response["context"]
-
-#sources = set()
-
-#for doc in docs:
-#    source = doc.metadata.get("source", "Unknown")
-#    page = doc.metadata.get("page", "N/A")
-
-    # Clean file name
-#    source_name = source.split("/")[-1]
-
-#    sources.add(f"{source_name} (Page {page})")
-
-#print("RESULT:\n", result)
-
-#print("\nSOURCE DOCUMENTS:")
-#for source in sources:
-#    print("-", source)
